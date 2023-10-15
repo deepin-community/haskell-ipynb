@@ -29,7 +29,7 @@ notebooks can be polymorphic, operating on `Notebook a`.
 module Data.Ipynb ( Notebook(..)
                   , NbV3
                   , NbV4
-                  , JSONMeta
+                  , JSONMeta(..)
                   , Cell(..)
                   , Source(..)
                   , CellType(..)
@@ -37,6 +37,7 @@ module Data.Ipynb ( Notebook(..)
                   , MimeType
                   , MimeData(..)
                   , MimeBundle(..)
+                  , MimeAttachments(..)
                   , breakLines
                   )
 where
@@ -48,8 +49,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Base64 as Base64
 import Data.Char (isSpace)
-import qualified Data.HashMap.Strict as HM
-import Data.List (partition)
+import Data.List (partition, sortOn)
 import qualified Data.Map as M
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
@@ -61,7 +61,13 @@ import Prelude
 #else
 import Data.Semigroup
 #endif
-
+#if MIN_VERSION_aeson(2,0,0)
+import qualified Data.Aeson.KeyMap as KM
+#else
+import qualified Data.HashMap.Strict as KM
+#endif
+import Data.String
+import qualified Data.Set as Set
 
 -- | Indexes 'Notebook' for serialization as nbformat version 3.
 data NbV3
@@ -142,7 +148,12 @@ instance ToJSON (Notebook NbV3) where
      ]
    ]
 
-type JSONMeta = M.Map Text Value
+newtype JSONMeta = JSONMeta (M.Map Text Value)
+  deriving (Show, Eq, Ord, Generic, Semigroup, Monoid, FromJSON)
+
+instance ToJSON JSONMeta where
+   toJSON = genericToJSON defaultOptions
+   toEncoding = genericToEncoding defaultOptions
 
 -- | A 'Source' is a textual content which may be
 -- represented in JSON either as a single string
@@ -158,17 +169,26 @@ instance FromJSON Source where
 instance ToJSON Source where
   toJSON (Source ts) = toJSON ts
 
+newtype MimeAttachments = MimeAttachments (M.Map Text MimeBundle)
+  deriving (Show, Eq, Ord, Generic, Semigroup, Monoid, FromJSON)
+
+instance ToJSON MimeAttachments where
+   toJSON = genericToJSON defaultOptions
+   toEncoding = genericToEncoding defaultOptions
+
 -- | A Jupyter notebook cell.
 data Cell a = Cell
   { cellType        :: CellType a
+  , cellId          :: Maybe Text
   , cellSource      :: Source
   , cellMetadata    :: JSONMeta
-  , cellAttachments :: Maybe (M.Map Text MimeBundle)
+  , cellAttachments :: Maybe MimeAttachments
 } deriving (Show, Eq, Generic)
 
 instance FromJSON (Cell NbV4) where
   parseJSON = withObject "Cell" $ \v -> do
     ty <- v .: "cell_type"
+    cell_id <- v.:? "id"
     cell_type <-
       case ty of
         "markdown" -> pure Markdown
@@ -183,6 +203,7 @@ instance FromJSON (Cell NbV4) where
     source <- v .: "source"
     return
       Cell{ cellType = cell_type
+          , cellId = cell_id
           , cellMetadata = metadata
           , cellAttachments = attachments
           , cellSource = source
@@ -207,6 +228,7 @@ instance FromJSON (Cell NbV3) where
                  else v .: "source"
     return
       Cell{ cellType = cell_type
+          , cellId = Nothing
           , cellMetadata = metadata
           , cellAttachments = Nothing
           , cellSource = source
@@ -216,6 +238,7 @@ instance FromJSON (Cell NbV3) where
 instance ToJSON (Cell NbV4) where
  toJSON c = object $
    ("metadata" .= cellMetadata c) :
+   maybe [] (\x -> ["id" .= cellId c]) (cellId c) ++
    maybe [] (\x -> ["attachments" .= x]) (cellAttachments c) ++
    case cellType c of
      Markdown -> [ "cell_type" .= ("markdown" :: Text)
@@ -266,21 +289,20 @@ instance ToJSON (Cell NbV3) where
 -- in v3, certain metadata fields occur in the main cell object.
 -- e.g. collapsed, language.
 metadataToV3Pairs :: JSONMeta -> [Aeson.Pair]
-metadataToV3Pairs meta =
-  ("metadata" .= M.fromList regMeta) : map toPair extraMeta
+metadataToV3Pairs (JSONMeta meta) =
+  ("metadata" .= JSONMeta (M.fromList regMeta)) : map toPair extraMeta
   where (extraMeta, regMeta) = partition isExtraMeta $ M.toList meta
-        toPair (k,v) = k .= v
+        toPair (k,v) = (fromString (T.unpack k)) .= v
+        isExtraMeta (k,_) = k `Set.member` v3MetaInMainCell
 
-v3MetaInMainCell :: [Text]
-v3MetaInMainCell = ["collapsed", "language"]
+v3MetaInMainCell :: Set.Set Text
+v3MetaInMainCell = Set.fromList ["collapsed", "language"]
 
-isExtraMeta :: (Text, a) -> Bool
-isExtraMeta (k,_) = k `elem` v3MetaInMainCell
-
-parseV3Metadata :: HM.HashMap Text Value -> Aeson.Parser JSONMeta
+parseV3Metadata :: Aeson.Object -> Aeson.Parser JSONMeta
 parseV3Metadata v = do
   meta <- v .:? "metadata" .!= mempty
-  let extraMeta = M.fromList $ filter isExtraMeta $ HM.toList v
+  vm <- parseJSON (Object v)
+  let extraMeta = JSONMeta (M.restrictKeys vm v3MetaInMainCell)
   return (meta <> extraMeta)
 
 -- | Information about the type of a notebook cell, plus
@@ -382,7 +404,7 @@ extractNbV3Data v = do
       go ("jpeg", x)          = Just ("image/jpeg", x)
       go ("javascript", x)    = Just ("application/javascript", x)
       go (_, _)               = Nothing -- TODO complete list? where documented?
-  parseJSON (Object . HM.fromList . mapMaybe go . HM.toList $ v)
+  parseJSON (Object . KM.fromList . mapMaybe go . KM.toList $ v)
 
 instance ToJSON (Output NbV4) where
   toJSON s@Stream{} = object
@@ -434,11 +456,11 @@ instance ToJSON (Output NbV3) where
 
 adjustV3DataFields :: Value -> Value
 adjustV3DataFields (Object hm) =
-  case HM.lookup "data" hm of
+  case KM.lookup "data" hm of
     Just (Object dm) -> Object $
-      HM.delete "data" $ foldr
-      (\(k, v) -> HM.insert (modKey k) v) hm
-      (HM.toList dm)
+      KM.delete "data" $ foldr
+      (\(k, v) -> KM.insert (modKey k) v) hm
+      (KM.toList dm)
     _ -> Object hm
   where  modKey "text/plain"             = "text"
          modKey "text/latex"             = "latex"
@@ -454,13 +476,28 @@ data MimeData =
     BinaryData ByteString
   | TextualData Text
   | JsonData Value
-  deriving (Show, Eq, Generic)
+  deriving (Show, Eq, Ord, Generic)
+
+instance ToJSON MimeData where
+  toJSON = toJSON . mimeDataToValue
+  toEncoding = toEncoding . mimeDataToValue
+
+mimeDataToValue :: MimeData -> Value
+mimeDataToValue (BinaryData bs) =
+  toJSON .
+    TE.decodeUtf8 .
+    (<> "\n") .
+    B.intercalate "\n" .  chunksOf 76 .
+    Base64.encode
+    $ bs
+mimeDataToValue (JsonData v) = v
+mimeDataToValue (TextualData t) = toJSON (breakLines t)
 
 type MimeType = Text
 
 -- | A 'MimeBundle' wraps a map from mime types to mime data.
 newtype MimeBundle = MimeBundle{ unMimeBundle :: M.Map MimeType MimeData }
-  deriving (Show, Eq, Generic, Semigroup, Monoid)
+  deriving (Show, Eq, Ord, Generic, Semigroup, Monoid)
 
 instance FromJSON MimeBundle where
   parseJSON v = do
@@ -483,16 +520,10 @@ pairToMimeData (mt, v) = do
 
 instance ToJSON MimeBundle where
   toJSON (MimeBundle m) =
-    let mimeBundleToValue (BinaryData bs) =
-          toJSON .
-            TE.decodeUtf8 .
-            (<> "\n") .
-            B.intercalate "\n" .  chunksOf 76 .
-            Base64.encode
-            $ bs
-        mimeBundleToValue (JsonData v) = v
-        mimeBundleToValue (TextualData t) = toJSON (breakLines t)
-    in  toJSON $ M.map mimeBundleToValue m
+    toJSON m
+  toEncoding (MimeBundle m) =  -- ensure deterministic (sorted) order
+    pairs $ mconcat $ map (\(k,v) -> (fromString (T.unpack k) Aeson..= v))
+                          (sortOn fst (M.toList m))
 
 chunksOf :: Int -> ByteString -> [ByteString]
 chunksOf k s
